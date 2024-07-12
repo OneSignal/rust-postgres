@@ -224,7 +224,7 @@ impl DbError {
     ///
     /// Might run to multiple lines.
     pub fn detail(&self) -> Option<&str> {
-        self.detail.as_ref().map(|s| &**s)
+        self.detail.as_deref()
     }
 
     /// An optional suggestion what to do about the problem.
@@ -233,7 +233,7 @@ impl DbError {
     /// (potentially inappropriate) rather than hard facts. Might run to
     /// multiple lines.
     pub fn hint(&self) -> Option<&str> {
-        self.hint.as_ref().map(|s| &**s)
+        self.hint.as_deref()
     }
 
     /// An optional error cursor position into either the original query string
@@ -248,20 +248,20 @@ impl DbError {
     /// language functions and internally-generated queries. The trace is one
     /// entry per line, most recent first.
     pub fn where_(&self) -> Option<&str> {
-        self.where_.as_ref().map(|s| &**s)
+        self.where_.as_deref()
     }
 
     /// If the error was associated with a specific database object, the name
     /// of the schema containing that object, if any. (PostgreSQL 9.3+)
     pub fn schema(&self) -> Option<&str> {
-        self.schema.as_ref().map(|s| &**s)
+        self.schema.as_deref()
     }
 
     /// If the error was associated with a specific table, the name of the
     /// table. (Refer to the schema name field for the name of the table's
     /// schema.) (PostgreSQL 9.3+)
     pub fn table(&self) -> Option<&str> {
-        self.table.as_ref().map(|s| &**s)
+        self.table.as_deref()
     }
 
     /// If the error was associated with a specific table column, the name of
@@ -270,14 +270,14 @@ impl DbError {
     /// (Refer to the schema and table name fields to identify the table.)
     /// (PostgreSQL 9.3+)
     pub fn column(&self) -> Option<&str> {
-        self.column.as_ref().map(|s| &**s)
+        self.column.as_deref()
     }
 
     /// If the error was associated with a specific data type, the name of the
     /// data type. (Refer to the schema name field for the name of the data
     /// type's schema.) (PostgreSQL 9.3+)
     pub fn datatype(&self) -> Option<&str> {
-        self.datatype.as_ref().map(|s| &**s)
+        self.datatype.as_deref()
     }
 
     /// If the error was associated with a specific constraint, the name of the
@@ -287,12 +287,12 @@ impl DbError {
     /// (For this purpose, indexes are treated as constraints, even if they
     /// weren't created with constraint syntax.) (PostgreSQL 9.3+)
     pub fn constraint(&self) -> Option<&str> {
-        self.constraint.as_ref().map(|s| &**s)
+        self.constraint.as_deref()
     }
 
     /// The file name of the source-code location where the error was reported.
     pub fn file(&self) -> Option<&str> {
-        self.file.as_ref().map(|s| &**s)
+        self.file.as_deref()
     }
 
     /// The line number of the source-code location where the error was
@@ -303,13 +303,20 @@ impl DbError {
 
     /// The name of the source-code routine reporting the error.
     pub fn routine(&self) -> Option<&str> {
-        self.routine.as_ref().map(|s| &**s)
+        self.routine.as_deref()
     }
 }
 
 impl fmt::Display for DbError {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(fmt, "{}: {}", self.severity, self.message)
+        write!(fmt, "{}: {}", self.severity, self.message)?;
+        if let Some(detail) = &self.detail {
+            write!(fmt, "\nDETAIL: {}", detail)?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(fmt, "\nHINT: {}", hint)?;
+        }
+        Ok(())
     }
 }
 
@@ -336,8 +343,7 @@ enum Kind {
     Tls,
     ToSql(usize),
     FromSql(usize),
-    Column,
-    CopyInStream,
+    Column(String),
     Closed,
     Db,
     Parse,
@@ -345,8 +351,10 @@ enum Kind {
     Authentication,
     ConfigParse,
     Config,
+    RowCount,
     #[cfg(feature = "runtime")]
     Connect,
+    Timeout,
 }
 
 struct ErrorInner {
@@ -368,14 +376,13 @@ impl fmt::Debug for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0.kind {
+        match &self.0.kind {
             Kind::Io => fmt.write_str("error communicating with the server")?,
             Kind::UnexpectedMessage => fmt.write_str("unexpected message from server")?,
             Kind::Tls => fmt.write_str("error performing TLS handshake")?,
             Kind::ToSql(idx) => write!(fmt, "error serializing parameter {}", idx)?,
             Kind::FromSql(idx) => write!(fmt, "error deserializing column {}", idx)?,
-            Kind::Column => fmt.write_str("invalid column")?,
-            Kind::CopyInStream => fmt.write_str("error from a copy_in stream")?,
+            Kind::Column(column) => write!(fmt, "invalid column `{}`", column)?,
             Kind::Closed => fmt.write_str("connection closed")?,
             Kind::Db => fmt.write_str("db error")?,
             Kind::Parse => fmt.write_str("error parsing response from server")?,
@@ -383,8 +390,10 @@ impl fmt::Display for Error {
             Kind::Authentication => fmt.write_str("authentication error")?,
             Kind::ConfigParse => fmt.write_str("invalid connection string")?,
             Kind::Config => fmt.write_str("invalid configuration")?,
+            Kind::RowCount => fmt.write_str("query returned an unexpected number of rows")?,
             #[cfg(feature = "runtime")]
             Kind::Connect => fmt.write_str("error connecting to server")?,
+            Kind::Timeout => fmt.write_str("timeout waiting for server")?,
         };
         if let Some(ref cause) = self.0.cause {
             write!(fmt, ": {}", cause)?;
@@ -405,14 +414,23 @@ impl Error {
         self.0.cause
     }
 
+    /// Returns the source of this error if it was a `DbError`.
+    ///
+    /// This is a simple convenience method.
+    pub fn as_db_error(&self) -> Option<&DbError> {
+        self.source().and_then(|e| e.downcast_ref::<DbError>())
+    }
+
+    /// Determines if the error was associated with closed connection.
+    pub fn is_closed(&self) -> bool {
+        self.0.kind == Kind::Closed
+    }
+
     /// Returns the SQLSTATE error code associated with the error.
     ///
-    /// This is a convenience method that downcasts the cause to a `DbError`
-    /// and returns its code.
+    /// This is a convenience method that downcasts the cause to a `DbError` and returns its code.
     pub fn code(&self) -> Option<&SqlState> {
-        self.source()
-            .and_then(|e| e.downcast_ref::<DbError>())
-            .map(DbError::code)
+        self.as_db_error().map(DbError::code)
     }
 
     fn new(kind: Kind, cause: Option<Box<dyn error::Error + Sync + Send>>) -> Error {
@@ -452,15 +470,8 @@ impl Error {
         Error::new(Kind::FromSql(idx), Some(e))
     }
 
-    pub(crate) fn column() -> Error {
-        Error::new(Kind::Column, None)
-    }
-
-    pub(crate) fn copy_in_stream<E>(e: E) -> Error
-    where
-        E: Into<Box<dyn error::Error + Sync + Send>>,
-    {
-        Error::new(Kind::CopyInStream, Some(e.into()))
+    pub(crate) fn column(column: String) -> Error {
+        Error::new(Kind::Column(column), None)
     }
 
     pub(crate) fn tls(e: Box<dyn error::Error + Sync + Send>) -> Error {
@@ -483,8 +494,17 @@ impl Error {
         Error::new(Kind::Config, Some(e))
     }
 
+    pub(crate) fn row_count() -> Error {
+        Error::new(Kind::RowCount, None)
+    }
+
     #[cfg(feature = "runtime")]
     pub(crate) fn connect(e: io::Error) -> Error {
         Error::new(Kind::Connect, Some(Box::new(e)))
+    }
+
+    #[doc(hidden)]
+    pub fn __private_api_timeout() -> Error {
+        Error::new(Kind::Timeout, None)
     }
 }

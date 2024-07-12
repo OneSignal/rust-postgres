@@ -1,9 +1,11 @@
 //! SASL-based authentication support.
 
-use generic_array::typenum::U32;
-use generic_array::GenericArray;
+use base64::display::Base64Display;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use hmac::{Hmac, Mac};
 use rand::{self, Rng};
+use sha2::digest::FixedOutput;
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 use std::io;
@@ -33,25 +35,26 @@ fn normalize(pass: &[u8]) -> Vec<u8> {
     }
 }
 
-fn hi(str: &[u8], salt: &[u8], i: u32) -> GenericArray<u8, U32> {
-    let mut hmac = Hmac::<Sha256>::new_varkey(str).expect("HMAC is able to accept all key sizes");
-    hmac.input(salt);
-    hmac.input(&[0, 0, 0, 1]);
-    let mut prev = hmac.result().code();
+pub(crate) fn hi(str: &[u8], salt: &[u8], i: u32) -> [u8; 32] {
+    let mut hmac =
+        Hmac::<Sha256>::new_from_slice(str).expect("HMAC is able to accept all key sizes");
+    hmac.update(salt);
+    hmac.update(&[0, 0, 0, 1]);
+    let mut prev = hmac.finalize().into_bytes();
 
-    let mut hi = GenericArray::<u8, U32>::clone_from_slice(&prev);
+    let mut hi = prev;
 
     for _ in 1..i {
-        let mut hmac = Hmac::<Sha256>::new_varkey(str).expect("already checked above");
-        hmac.input(prev.as_slice());
-        prev = hmac.result().code();
+        let mut hmac = Hmac::<Sha256>::new_from_slice(str).expect("already checked above");
+        hmac.update(&prev);
+        prev = hmac.finalize().into_bytes();
 
         for (hi, prev) in hi.iter_mut().zip(prev) {
             *hi ^= prev;
         }
     }
 
-    hi
+    hi.into()
 }
 
 enum ChannelBindingInner {
@@ -103,7 +106,7 @@ enum State {
         channel_binding: ChannelBinding,
     },
     Finish {
-        salted_password: GenericArray<u8, U32>,
+        salted_password: [u8; 32],
         auth_message: String,
     },
     Done,
@@ -136,7 +139,7 @@ impl ScramSha256 {
         let mut rng = rand::thread_rng();
         let nonce = (0..NONCE_LENGTH)
             .map(|_| {
-                let mut v = rng.gen_range(0x21u8, 0x7e);
+                let mut v = rng.gen_range(0x21u8..0x7e);
                 if v == 0x2c {
                     v = 0x7e
                 }
@@ -189,43 +192,48 @@ impl ScramSha256 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid nonce"));
         }
 
-        let salt = match base64::decode(parsed.salt) {
+        let salt = match STANDARD.decode(parsed.salt) {
             Ok(salt) => salt,
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
         };
 
         let salted_password = hi(&password, &salt, parsed.iteration_count);
 
-        let mut hmac = Hmac::<Sha256>::new_varkey(&salted_password)
+        let mut hmac = Hmac::<Sha256>::new_from_slice(&salted_password)
             .expect("HMAC is able to accept all key sizes");
-        hmac.input(b"Client Key");
-        let client_key = hmac.result().code();
+        hmac.update(b"Client Key");
+        let client_key = hmac.finalize().into_bytes();
 
         let mut hash = Sha256::default();
-        hash.input(client_key.as_slice());
-        let stored_key = hash.result();
+        hash.update(client_key.as_slice());
+        let stored_key = hash.finalize_fixed();
 
         let mut cbind_input = vec![];
         cbind_input.extend(channel_binding.gs2_header().as_bytes());
         cbind_input.extend(channel_binding.cbind_data());
-        let cbind_input = base64::encode(&cbind_input);
+        let cbind_input = STANDARD.encode(&cbind_input);
 
         self.message.clear();
         write!(&mut self.message, "c={},r={}", cbind_input, parsed.nonce).unwrap();
 
         let auth_message = format!("n=,r={},{},{}", client_nonce, message, self.message);
 
-        let mut hmac =
-            Hmac::<Sha256>::new_varkey(&stored_key).expect("HMAC is able to accept all key sizes");
-        hmac.input(auth_message.as_bytes());
-        let client_signature = hmac.result();
+        let mut hmac = Hmac::<Sha256>::new_from_slice(&stored_key)
+            .expect("HMAC is able to accept all key sizes");
+        hmac.update(auth_message.as_bytes());
+        let client_signature = hmac.finalize().into_bytes();
 
-        let mut client_proof = GenericArray::<u8, U32>::clone_from_slice(&client_key);
-        for (proof, signature) in client_proof.iter_mut().zip(client_signature.code()) {
+        let mut client_proof = client_key;
+        for (proof, signature) in client_proof.iter_mut().zip(client_signature) {
             *proof ^= signature;
         }
 
-        write!(&mut self.message, ",p={}", base64::encode(&*client_proof)).unwrap();
+        write!(
+            &mut self.message,
+            ",p={}",
+            Base64Display::new(&client_proof, &STANDARD)
+        )
+        .unwrap();
 
         self.state = State::Finish {
             salted_password,
@@ -262,20 +270,20 @@ impl ScramSha256 {
             ServerFinalMessage::Verifier(verifier) => verifier,
         };
 
-        let verifier = match base64::decode(verifier) {
+        let verifier = match STANDARD.decode(verifier) {
             Ok(verifier) => verifier,
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
         };
 
-        let mut hmac = Hmac::<Sha256>::new_varkey(&salted_password)
+        let mut hmac = Hmac::<Sha256>::new_from_slice(&salted_password)
             .expect("HMAC is able to accept all key sizes");
-        hmac.input(b"Server Key");
-        let server_key = hmac.result();
+        hmac.update(b"Server Key");
+        let server_key = hmac.finalize().into_bytes();
 
-        let mut hmac = Hmac::<Sha256>::new_varkey(&server_key.code())
+        let mut hmac = Hmac::<Sha256>::new_from_slice(&server_key)
             .expect("HMAC is able to accept all key sizes");
-        hmac.input(auth_message.as_bytes());
-        hmac.verify(&verifier)
+        hmac.update(auth_message.as_bytes());
+        hmac.verify_slice(&verifier)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SCRAM verification error"))
     }
 }
@@ -331,10 +339,7 @@ impl<'a> Parser<'a> {
     }
 
     fn printable(&mut self) -> io::Result<&'a str> {
-        self.take_while(|c| match c {
-            '\x21'..='\x2b' | '\x2d'..='\x7e' => true,
-            _ => false,
-        })
+        self.take_while(|c| matches!(c, '\x21'..='\x2b' | '\x2d'..='\x7e'))
     }
 
     fn nonce(&mut self) -> io::Result<&'a str> {
@@ -344,10 +349,7 @@ impl<'a> Parser<'a> {
     }
 
     fn base64(&mut self) -> io::Result<&'a str> {
-        self.take_while(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '+' | '=' => true,
-            _ => false,
-        })
+        self.take_while(|c| matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '+' | '='))
     }
 
     fn salt(&mut self) -> io::Result<&'a str> {
@@ -357,10 +359,7 @@ impl<'a> Parser<'a> {
     }
 
     fn posit_number(&mut self) -> io::Result<u32> {
-        let n = self.take_while(|c| match c {
-            '0'..='9' => true,
-            _ => false,
-        })?;
+        let n = self.take_while(|c| matches!(c, '0'..='9'))?;
         n.parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
     }
@@ -397,10 +396,7 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> io::Result<&'a str> {
-        self.take_while(|c| match c {
-            '\0' | '=' | ',' => false,
-            _ => true,
-        })
+        self.take_while(|c| matches!(c, '\0' | '=' | ','))
     }
 
     fn server_error(&mut self) -> io::Result<Option<&'a str>> {

@@ -1,107 +1,118 @@
-use fallible_iterator::FallibleIterator;
-use futures::Future;
-use std::io::Read;
-use tokio_postgres::types::{ToSql, Type};
+use crate::connection::ConnectionRef;
+use crate::{CancelToken, CopyInWriter, CopyOutReader, Portal, RowIter, Statement, ToStatement};
+use tokio_postgres::types::{BorrowToSql, ToSql, Type};
 use tokio_postgres::{Error, Row, SimpleQueryMessage};
-
-use crate::{
-    Client, CopyOutReader, Portal, QueryIter, QueryPortalIter, SimpleQueryIter, Statement,
-    ToStatement,
-};
 
 /// A representation of a PostgreSQL database transaction.
 ///
 /// Transactions will implicitly roll back by default when dropped. Use the `commit` method to commit the changes made
-/// in the transaction. Transactions can be nested, with inner transactions implemented via safepoints.
+/// in the transaction. Transactions can be nested, with inner transactions implemented via savepoints.
 pub struct Transaction<'a> {
-    client: &'a mut Client,
-    depth: u32,
-    done: bool,
+    connection: ConnectionRef<'a>,
+    transaction: Option<tokio_postgres::Transaction<'a>>,
 }
 
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
-        if !self.done {
-            let _ = self.rollback_inner();
+        if let Some(transaction) = self.transaction.take() {
+            let _ = self.connection.block_on(transaction.rollback());
         }
     }
 }
 
 impl<'a> Transaction<'a> {
-    pub(crate) fn new(client: &'a mut Client) -> Transaction<'a> {
+    pub(crate) fn new(
+        connection: ConnectionRef<'a>,
+        transaction: tokio_postgres::Transaction<'a>,
+    ) -> Transaction<'a> {
         Transaction {
-            client,
-            depth: 0,
-            done: false,
+            connection,
+            transaction: Some(transaction),
         }
     }
 
     /// Consumes the transaction, committing all changes made within it.
     pub fn commit(mut self) -> Result<(), Error> {
-        self.done = true;
-        if self.depth == 0 {
-            self.client.simple_query("COMMIT")?;
-        } else {
-            self.client
-                .simple_query(&format!("RELEASE sp{}", self.depth))?;
-        }
-        Ok(())
+        self.connection
+            .block_on(self.transaction.take().unwrap().commit())
     }
 
     /// Rolls the transaction back, discarding all changes made within it.
     ///
     /// This is equivalent to `Transaction`'s `Drop` implementation, but provides any error encountered to the caller.
     pub fn rollback(mut self) -> Result<(), Error> {
-        self.done = true;
-        self.rollback_inner()
-    }
-
-    fn rollback_inner(&mut self) -> Result<(), Error> {
-        if self.depth == 0 {
-            self.client.simple_query("ROLLBACK")?;
-        } else {
-            self.client
-                .simple_query(&format!("ROLLBACK TO sp{}", self.depth))?;
-        }
-        Ok(())
+        self.connection
+            .block_on(self.transaction.take().unwrap().rollback())
     }
 
     /// Like `Client::prepare`.
     pub fn prepare(&mut self, query: &str) -> Result<Statement, Error> {
-        self.client.prepare(query)
+        self.connection
+            .block_on(self.transaction.as_ref().unwrap().prepare(query))
     }
 
     /// Like `Client::prepare_typed`.
     pub fn prepare_typed(&mut self, query: &str, types: &[Type]) -> Result<Statement, Error> {
-        self.client.prepare_typed(query, types)
+        self.connection.block_on(
+            self.transaction
+                .as_ref()
+                .unwrap()
+                .prepare_typed(query, types),
+        )
     }
 
     /// Like `Client::execute`.
-    pub fn execute<T>(&mut self, query: &T, params: &[&dyn ToSql]) -> Result<u64, Error>
+    pub fn execute<T>(&mut self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement,
     {
-        self.client.execute(query, params)
+        self.connection
+            .block_on(self.transaction.as_ref().unwrap().execute(query, params))
     }
 
     /// Like `Client::query`.
-    pub fn query<T>(&mut self, query: &T, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error>
+    pub fn query<T>(&mut self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error>
     where
         T: ?Sized + ToStatement,
     {
-        self.client.query(query, params)
+        self.connection
+            .block_on(self.transaction.as_ref().unwrap().query(query, params))
     }
 
-    /// Like `Client::query_iter`.
-    pub fn query_iter<T>(
-        &mut self,
-        query: &T,
-        params: &[&dyn ToSql],
-    ) -> Result<QueryIter<'_>, Error>
+    /// Like `Client::query_one`.
+    pub fn query_one<T>(&mut self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error>
     where
         T: ?Sized + ToStatement,
     {
-        self.client.query_iter(query, params)
+        self.connection
+            .block_on(self.transaction.as_ref().unwrap().query_one(query, params))
+    }
+
+    /// Like `Client::query_opt`.
+    pub fn query_opt<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<Row>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.connection
+            .block_on(self.transaction.as_ref().unwrap().query_opt(query, params))
+    }
+
+    /// Like `Client::query_raw`.
+    pub fn query_raw<T, P, I>(&mut self, query: &T, params: I) -> Result<RowIter<'_>, Error>
+    where
+        T: ?Sized + ToStatement,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let stream = self
+            .connection
+            .block_on(self.transaction.as_ref().unwrap().query_raw(query, params))?;
+        Ok(RowIter::new(self.connection.as_ref(), stream))
     }
 
     /// Binds parameters to a statement, creating a "portal".
@@ -114,12 +125,12 @@ impl<'a> Transaction<'a> {
     /// # Panics
     ///
     /// Panics if the number of parameters provided does not match the number expected.
-    pub fn bind<T>(&mut self, query: &T, params: &[&dyn ToSql]) -> Result<Portal, Error>
+    pub fn bind<T>(&mut self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Portal, Error>
     where
         T: ?Sized + ToStatement,
     {
-        let statement = query.__statement(&mut self.client)?;
-        self.client.get_mut().bind(&statement, params).wait()
+        self.connection
+            .block_on(self.transaction.as_ref().unwrap().bind(query, params))
     }
 
     /// Continues execution of a portal, returning the next set of rows.
@@ -127,66 +138,84 @@ impl<'a> Transaction<'a> {
     /// Unlike `query`, portals can be incrementally evaluated by limiting the number of rows returned in each call to
     /// `query_portal`. If the requested number is negative or 0, all remaining rows will be returned.
     pub fn query_portal(&mut self, portal: &Portal, max_rows: i32) -> Result<Vec<Row>, Error> {
-        self.query_portal_iter(portal, max_rows)?.collect()
+        self.connection.block_on(
+            self.transaction
+                .as_ref()
+                .unwrap()
+                .query_portal(portal, max_rows),
+        )
     }
 
-    /// Like `query_portal`, except that it returns a fallible iterator over the resulting rows rather than buffering
-    /// the entire response in memory.
-    pub fn query_portal_iter(
+    /// The maximally flexible version of `query_portal`.
+    pub fn query_portal_raw(
         &mut self,
         portal: &Portal,
         max_rows: i32,
-    ) -> Result<QueryPortalIter<'_>, Error> {
-        Ok(QueryPortalIter::new(
-            self.client.get_mut().query_portal(&portal, max_rows),
-        ))
+    ) -> Result<RowIter<'_>, Error> {
+        let stream = self.connection.block_on(
+            self.transaction
+                .as_ref()
+                .unwrap()
+                .query_portal_raw(portal, max_rows),
+        )?;
+        Ok(RowIter::new(self.connection.as_ref(), stream))
     }
 
     /// Like `Client::copy_in`.
-    pub fn copy_in<T, R>(
-        &mut self,
-        query: &T,
-        params: &[&dyn ToSql],
-        reader: R,
-    ) -> Result<u64, Error>
+    pub fn copy_in<T>(&mut self, query: &T) -> Result<CopyInWriter<'_>, Error>
     where
         T: ?Sized + ToStatement,
-        R: Read,
     {
-        self.client.copy_in(query, params, reader)
+        let sink = self
+            .connection
+            .block_on(self.transaction.as_ref().unwrap().copy_in(query))?;
+        Ok(CopyInWriter::new(self.connection.as_ref(), sink))
     }
 
     /// Like `Client::copy_out`.
-    pub fn copy_out<T>(
-        &mut self,
-        query: &T,
-        params: &[&dyn ToSql],
-    ) -> Result<CopyOutReader<'_>, Error>
+    pub fn copy_out<T>(&mut self, query: &T) -> Result<CopyOutReader<'_>, Error>
     where
         T: ?Sized + ToStatement,
     {
-        self.client.copy_out(query, params)
+        let stream = self
+            .connection
+            .block_on(self.transaction.as_ref().unwrap().copy_out(query))?;
+        Ok(CopyOutReader::new(self.connection.as_ref(), stream))
     }
 
     /// Like `Client::simple_query`.
     pub fn simple_query(&mut self, query: &str) -> Result<Vec<SimpleQueryMessage>, Error> {
-        self.client.simple_query(query)
+        self.connection
+            .block_on(self.transaction.as_ref().unwrap().simple_query(query))
     }
 
-    /// Like `Client::simple_query_iter`.
-    pub fn simple_query_iter(&mut self, query: &str) -> Result<SimpleQueryIter<'_>, Error> {
-        self.client.simple_query_iter(query)
+    /// Like `Client::batch_execute`.
+    pub fn batch_execute(&mut self, query: &str) -> Result<(), Error> {
+        self.connection
+            .block_on(self.transaction.as_ref().unwrap().batch_execute(query))
     }
 
-    /// Like `Client::transaction`.
+    /// Like `Client::cancel_token`.
+    pub fn cancel_token(&self) -> CancelToken {
+        CancelToken::new(self.transaction.as_ref().unwrap().cancel_token())
+    }
+
+    /// Like `Client::transaction`, but creates a nested transaction via a savepoint.
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        let depth = self.depth + 1;
-        self.client
-            .simple_query(&format!("SAVEPOINT sp{}", depth))?;
-        Ok(Transaction {
-            client: self.client,
-            depth,
-            done: false,
-        })
+        let transaction = self
+            .connection
+            .block_on(self.transaction.as_mut().unwrap().transaction())?;
+        Ok(Transaction::new(self.connection.as_ref(), transaction))
+    }
+
+    /// Like `Client::transaction`, but creates a nested transaction via a savepoint with the specified name.
+    pub fn savepoint<I>(&mut self, name: I) -> Result<Transaction<'_>, Error>
+    where
+        I: Into<String>,
+    {
+        let transaction = self
+            .connection
+            .block_on(self.transaction.as_mut().unwrap().savepoint(name))?;
+        Ok(Transaction::new(self.connection.as_ref(), transaction))
     }
 }

@@ -4,9 +4,11 @@
 //!
 //! ```no_run
 //! use openssl::ssl::{SslConnector, SslMethod};
+//! # #[cfg(feature = "runtime")]
 //! use postgres_openssl::MakeTlsConnector;
 //!
-//! # fn main() -> Result<(), Box<std::error::Error>> {
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # #[cfg(feature = "runtime")] {
 //! let mut builder = SslConnector::builder(SslMethod::tls())?;
 //! builder.set_ca_file("database_cert.pem")?;
 //! let connector = MakeTlsConnector::new(builder.build());
@@ -15,6 +17,7 @@
 //!     "host=localhost user=postgres sslmode=require",
 //!     connector,
 //! );
+//! # }
 //!
 //! // ...
 //! # Ok(())
@@ -23,44 +26,55 @@
 //!
 //! ```no_run
 //! use openssl::ssl::{SslConnector, SslMethod};
+//! # #[cfg(feature = "runtime")]
 //! use postgres_openssl::MakeTlsConnector;
 //!
-//! # fn main() -> Result<(), Box<std::error::Error>> {
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # #[cfg(feature = "runtime")] {
 //! let mut builder = SslConnector::builder(SslMethod::tls())?;
 //! builder.set_ca_file("database_cert.pem")?;
 //! let connector = MakeTlsConnector::new(builder.build());
 //!
-//! let mut client = postgres::Client::connect(
+//! let client = postgres::Client::connect(
 //!     "host=localhost user=postgres sslmode=require",
 //!     connector,
 //! )?;
+//! # }
 //!
 //! // ...
 //! # Ok(())
 //! # }
 //! ```
-#![doc(html_root_url = "https://docs.rs/postgres-openssl/0.2.0-rc.1")]
 #![warn(rust_2018_idioms, clippy::all, missing_docs)]
 
-use futures::{try_ready, Async, Future, Poll};
 #[cfg(feature = "runtime")]
 use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 #[cfg(feature = "runtime")]
 use openssl::ssl::SslConnector;
-use openssl::ssl::{ConnectConfiguration, HandshakeError, SslRef};
-use std::fmt::Debug;
+use openssl::ssl::{self, ConnectConfiguration, SslRef};
+use openssl::x509::X509VerifyResult;
+use std::error::Error;
+use std::fmt::{self, Debug};
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 #[cfg(feature = "runtime")]
 use std::sync::Arc;
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_openssl::{ConnectAsync, ConnectConfigurationExt, SslStream};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
+use tokio_openssl::SslStream;
+use tokio_postgres::tls;
 #[cfg(feature = "runtime")]
 use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::tls::{ChannelBinding, TlsConnect};
 
 #[cfg(test)]
 mod test;
+
+type ConfigCallback =
+    dyn Fn(&mut ConnectConfiguration, &str) -> Result<(), ErrorStack> + Sync + Send;
 
 /// A `MakeTlsConnect` implementation using the `openssl` crate.
 ///
@@ -69,7 +83,7 @@ mod test;
 #[derive(Clone)]
 pub struct MakeTlsConnector {
     connector: SslConnector,
-    config: Arc<dyn Fn(&mut ConnectConfiguration, &str) -> Result<(), ErrorStack> + Sync + Send>,
+    config: Arc<ConfigCallback>,
 }
 
 #[cfg(feature = "runtime")]
@@ -96,9 +110,9 @@ impl MakeTlsConnector {
 #[cfg(feature = "runtime")]
 impl<S> MakeTlsConnect<S> for MakeTlsConnector
 where
-    S: AsyncRead + AsyncWrite + Debug + 'static + Sync + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Debug + 'static + Sync + Send,
 {
-    type Stream = SslStream<S>;
+    type Stream = TlsStream<S>;
     type TlsConnect = TlsConnector;
     type Error = ErrorStack;
 
@@ -127,36 +141,102 @@ impl TlsConnector {
 
 impl<S> TlsConnect<S> for TlsConnector
 where
-    S: AsyncRead + AsyncWrite + Debug + 'static + Sync + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    type Stream = SslStream<S>;
-    type Error = HandshakeError<S>;
-    type Future = TlsConnectFuture<S>;
+    type Stream = TlsStream<S>;
+    type Error = Box<dyn Error + Send + Sync>;
+    #[allow(clippy::type_complexity)]
+    type Future = Pin<Box<dyn Future<Output = Result<TlsStream<S>, Self::Error>> + Send>>;
 
-    fn connect(self, stream: S) -> TlsConnectFuture<S> {
-        TlsConnectFuture(self.ssl.connect_async(&self.domain, stream))
+    fn connect(self, stream: S) -> Self::Future {
+        let stream = BufReader::with_capacity(8192, stream);
+        let future = async move {
+            let ssl = self.ssl.into_ssl(&self.domain)?;
+            let mut stream = SslStream::new(ssl, stream)?;
+            match Pin::new(&mut stream).connect().await {
+                Ok(()) => Ok(TlsStream(stream)),
+                Err(error) => Err(Box::new(ConnectError {
+                    error,
+                    verify_result: stream.ssl().verify_result(),
+                }) as _),
+            }
+        };
+
+        Box::pin(future)
     }
 }
 
-/// The future returned by `TlsConnector`.
-pub struct TlsConnectFuture<S>(ConnectAsync<S>);
+#[derive(Debug)]
+struct ConnectError {
+    error: ssl::Error,
+    verify_result: X509VerifyResult,
+}
 
-impl<S> Future for TlsConnectFuture<S>
+impl fmt::Display for ConnectError {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, fmt)?;
+
+        if self.verify_result != X509VerifyResult::OK {
+            fmt.write_str(": ")?;
+            fmt::Display::fmt(&self.verify_result, fmt)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Error for ConnectError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// The stream returned by `TlsConnector`.
+pub struct TlsStream<S>(SslStream<BufReader<S>>);
+
+impl<S> AsyncRead for TlsStream<S>
 where
-    S: AsyncRead + AsyncWrite + Debug + 'static + Sync + Send,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    type Item = (SslStream<S>, ChannelBinding);
-    type Error = HandshakeError<S>;
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
 
-    fn poll(&mut self) -> Poll<(SslStream<S>, ChannelBinding), HandshakeError<S>> {
-        let stream = try_ready!(self.0.poll());
+impl<S> AsyncWrite for TlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
 
-        let channel_binding = match tls_server_end_point(stream.get_ref().ssl()) {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+impl<S> tls::TlsStream for TlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn channel_binding(&self) -> ChannelBinding {
+        match tls_server_end_point(self.0.ssl()) {
             Some(buf) => ChannelBinding::tls_server_end_point(buf),
             None => ChannelBinding::none(),
-        };
-
-        Ok(Async::Ready((stream, channel_binding)))
+        }
     }
 }
 

@@ -1,13 +1,15 @@
-//! TLS support for `tokio-postgres` and `postgres` via `native-tls.
+//! TLS support for `tokio-postgres` and `postgres` via `native-tls`.
 //!
 //! # Examples
 //!
 //! ```no_run
 //! use native_tls::{Certificate, TlsConnector};
+//! # #[cfg(feature = "runtime")]
 //! use postgres_native_tls::MakeTlsConnector;
 //! use std::fs;
 //!
-//! # fn main() -> Result<(), Box<std::error::Error>> {
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # #[cfg(feature = "runtime")] {
 //! let cert = fs::read("database_cert.pem")?;
 //! let cert = Certificate::from_pem(&cert)?;
 //! let connector = TlsConnector::builder()
@@ -19,6 +21,7 @@
 //!     "host=localhost user=postgres sslmode=require",
 //!     connector,
 //! );
+//! # }
 //!
 //! // ...
 //! # Ok(())
@@ -27,10 +30,12 @@
 //!
 //! ```no_run
 //! use native_tls::{Certificate, TlsConnector};
+//! # #[cfg(feature = "runtime")]
 //! use postgres_native_tls::MakeTlsConnector;
 //! use std::fs;
 //!
-//! # fn main() -> Result<(), Box<std::error::Error>> {
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # #[cfg(feature = "runtime")] {
 //! let cert = fs::read("database_cert.pem")?;
 //! let cert = Certificate::from_pem(&cert)?;
 //! let connector = TlsConnector::builder()
@@ -38,22 +43,25 @@
 //!     .build()?;
 //! let connector = MakeTlsConnector::new(connector);
 //!
-//! let mut client = postgres::Client::connect(
+//! let client = postgres::Client::connect(
 //!     "host=localhost user=postgres sslmode=require",
 //!     connector,
 //! )?;
+//! # }
 //! # Ok(())
 //! # }
 //! ```
-#![doc(html_root_url = "https://docs.rs/postgres-native-tls/0.2.0-rc.1")]
 #![warn(rust_2018_idioms, clippy::all, missing_docs)]
 
-use futures::{try_ready, Async, Future, Poll};
-use tokio_io::{AsyncRead, AsyncWrite};
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
+use tokio_postgres::tls;
 #[cfg(feature = "runtime")]
 use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::tls::{ChannelBinding, TlsConnect};
-use tokio_tls::{Connect, TlsStream};
 
 #[cfg(test)]
 mod test;
@@ -76,7 +84,7 @@ impl MakeTlsConnector {
 #[cfg(feature = "runtime")]
 impl<S> MakeTlsConnect<S> for MakeTlsConnector
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Unpin + 'static + Send,
 {
     type Stream = TlsStream<S>;
     type TlsConnect = TlsConnector;
@@ -89,7 +97,7 @@ where
 
 /// A `TlsConnect` implementation using the `native-tls` crate.
 pub struct TlsConnector {
-    connector: tokio_tls::TlsConnector,
+    connector: tokio_native_tls::TlsConnector,
     domain: String,
 }
 
@@ -97,7 +105,7 @@ impl TlsConnector {
     /// Creates a new connector configured to connect to the specified domain.
     pub fn new(connector: native_tls::TlsConnector, domain: &str) -> TlsConnector {
         TlsConnector {
-            connector: tokio_tls::TlsConnector::from(connector),
+            connector: tokio_native_tls::TlsConnector::from(connector),
             domain: domain.to_string(),
         }
     }
@@ -105,35 +113,70 @@ impl TlsConnector {
 
 impl<S> TlsConnect<S> for TlsConnector
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Unpin + 'static + Send,
 {
     type Stream = TlsStream<S>;
     type Error = native_tls::Error;
-    type Future = TlsConnectFuture<S>;
+    #[allow(clippy::type_complexity)]
+    type Future = Pin<Box<dyn Future<Output = Result<TlsStream<S>, native_tls::Error>> + Send>>;
 
-    fn connect(self, stream: S) -> TlsConnectFuture<S> {
-        TlsConnectFuture(self.connector.connect(&self.domain, stream))
+    fn connect(self, stream: S) -> Self::Future {
+        let stream = BufReader::with_capacity(8192, stream);
+        let future = async move {
+            let stream = self.connector.connect(&self.domain, stream).await?;
+
+            Ok(TlsStream(stream))
+        };
+
+        Box::pin(future)
     }
 }
 
-/// The future returned by `TlsConnector`.
-pub struct TlsConnectFuture<S>(Connect<S>);
+/// The stream returned by `TlsConnector`.
+pub struct TlsStream<S>(tokio_native_tls::TlsStream<BufReader<S>>);
 
-impl<S> Future for TlsConnectFuture<S>
+impl<S> AsyncRead for TlsStream<S>
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    type Item = (TlsStream<S>, ChannelBinding);
-    type Error = native_tls::Error;
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
 
-    fn poll(&mut self) -> Poll<(TlsStream<S>, ChannelBinding), native_tls::Error> {
-        let stream = try_ready!(self.0.poll());
+impl<S> AsyncWrite for TlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
 
-        let channel_binding = match stream.get_ref().tls_server_end_point().unwrap_or(None) {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+impl<S> tls::TlsStream for TlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn channel_binding(&self) -> ChannelBinding {
+        match self.0.get_ref().tls_server_end_point().ok().flatten() {
             Some(buf) => ChannelBinding::tls_server_end_point(buf),
             None => ChannelBinding::none(),
-        };
-
-        Ok(Async::Ready((stream, channel_binding)))
+        }
     }
 }

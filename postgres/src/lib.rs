@@ -8,7 +8,7 @@
 //! # fn main() -> Result<(), postgres::Error> {
 //! let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
 //!
-//! client.simple_query("
+//! client.batch_execute("
 //!     CREATE TABLE person (
 //!         id      SERIAL PRIMARY KEY,
 //!         name    TEXT NOT NULL,
@@ -36,15 +36,9 @@
 //!
 //! # Implementation
 //!
-//! This crate is a lightweight wrapper over tokio-postgres. The `tokio_postgres::Connection` is spawned onto an
-//! executor, and the `tokio_postgres::Client` is wrapped in the `postgres::Client`, which simply waits on the futures
-//! the nonblocking client creates.
-//!
-//! # Runtime
-//!
-//! A client can be constructed directly from a `tokio-postgres` client via a `From` implementation, but the `runtime`
-//! Cargo feature (enabled by default) provides a more convenient interface. By default, connections will be spawned
-//! onto a static tokio `Runtime`, but a custom `Executor` can also be used instead.
+//! This crate is a lightweight wrapper over tokio-postgres. The `postgres::Client` is simply a wrapper around a
+//! `tokio_postgres::Client` along side a tokio `Runtime`. The client simply blocks on the futures provided by the async
+//! client.
 //!
 //! # SSL/TLS support
 //!
@@ -52,54 +46,63 @@
 //! as an argument. The `NoTls` type in this crate can be used when TLS is not required. Otherwise, the
 //! `postgres-openssl` and `postgres-native-tls` crates provide implementations backed by the `openssl` and `native-tls`
 //! crates, respectively.
-#![doc(html_root_url = "https://docs.rs/postgres/0.16.0-rc.2")]
+//!
+//! # Features
+//!
+//! The following features can be enabled from `Cargo.toml`:
+//!
+//! | Feature | Description | Extra dependencies | Default |
+//! | ------- | ----------- | ------------------ | ------- |
+//! | `with-bit-vec-0_6` | Enable support for the `bit-vec` crate. | [bit-vec](https://crates.io/crates/bit-vec) 0.6 | no |
+//! | `with-chrono-0_4` | Enable support for the `chrono` crate. | [chrono](https://crates.io/crates/chrono) 0.4 | no |
+//! | `with-eui48-0_4` | Enable support for the 0.4 version of the `eui48` crate. | [eui48](https://crates.io/crates/eui48) 0.4 | no |
+//! | `with-eui48-1` | Enable support for the 1.0 version of the `eui48` crate. | [eui48](https://crates.io/crates/eui48) 1.0 | no |
+//! | `with-geo-types-0_6` | Enable support for the 0.6 version of the `geo-types` crate. | [geo-types](https://crates.io/crates/geo-types/0.6.0) 0.6 | no |
+//! | `with-geo-types-0_7` | Enable support for the 0.7 version of the `geo-types` crate. | [geo-types](https://crates.io/crates/geo-types/0.7.0) 0.7 | no |
+//! | `with-serde_json-1` | Enable support for the `serde_json` crate. | [serde_json](https://crates.io/crates/serde_json) 1.0 | no |
+//! | `with-uuid-0_8` | Enable support for the `uuid` crate. | [uuid](https://crates.io/crates/uuid) 0.8 | no |
+//! | `with-uuid-1` | Enable support for the `uuid` crate. | [uuid](https://crates.io/crates/uuid) 1.0 | no |
+//! | `with-time-0_2` | Enable support for the 0.2 version of the `time` crate. | [time](https://crates.io/crates/time/0.2.0) 0.2 | no |
+//! | `with-time-0_3` | Enable support for the 0.3 version of the `time` crate. | [time](https://crates.io/crates/time/0.3.0) 0.3 | no |
 #![warn(clippy::all, rust_2018_idioms, missing_docs)]
 
-#[cfg(feature = "runtime")]
-use lazy_static::lazy_static;
-#[cfg(feature = "runtime")]
-use tokio::runtime::{self, Runtime};
-
-#[cfg(feature = "runtime")]
-pub use tokio_postgres::Socket;
+pub use fallible_iterator;
 pub use tokio_postgres::{
-    accepts, error, row, tls, to_sql_checked, types, Column, Portal, SimpleQueryMessage, Statement,
+    error, row, tls, types, Column, IsolationLevel, Notification, Portal, SimpleQueryMessage,
+    Socket, Statement, ToStatement,
 };
 
+pub use crate::cancel_token::CancelToken;
 pub use crate::client::*;
-#[cfg(feature = "runtime")]
 pub use crate::config::Config;
-pub use crate::copy_out_reader::*;
+pub use crate::copy_in_writer::CopyInWriter;
+pub use crate::copy_out_reader::CopyOutReader;
 #[doc(no_inline)]
 pub use crate::error::Error;
-pub use crate::query_iter::*;
-pub use crate::query_portal_iter::*;
+pub use crate::generic_client::GenericClient;
+#[doc(inline)]
+pub use crate::notifications::Notifications;
 #[doc(no_inline)]
 pub use crate::row::{Row, SimpleQueryRow};
-pub use crate::simple_query_iter::*;
+pub use crate::row_iter::RowIter;
 #[doc(no_inline)]
 pub use crate::tls::NoTls;
-pub use crate::to_statement::*;
 pub use crate::transaction::*;
+pub use crate::transaction_builder::TransactionBuilder;
 
+pub mod binary_copy;
+mod cancel_token;
 mod client;
-#[cfg(feature = "runtime")]
 pub mod config;
+mod connection;
+mod copy_in_writer;
 mod copy_out_reader;
-mod query_iter;
-mod query_portal_iter;
-mod simple_query_iter;
-mod to_statement;
+mod generic_client;
+mod lazy_pin;
+pub mod notifications;
+mod row_iter;
 mod transaction;
+mod transaction_builder;
 
-#[cfg(feature = "runtime")]
 #[cfg(test)]
 mod test;
-
-#[cfg(feature = "runtime")]
-lazy_static! {
-    static ref RUNTIME: Runtime = runtime::Builder::new()
-        .name_prefix("postgres-")
-        .build()
-        .unwrap();
-}

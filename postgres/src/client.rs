@@ -1,30 +1,36 @@
-use fallible_iterator::FallibleIterator;
-use futures::{Async, Future, Poll, Stream};
-use std::io::{self, Read};
+use crate::connection::Connection;
+use crate::{
+    CancelToken, Config, CopyInWriter, CopyOutReader, Notifications, RowIter, Statement,
+    ToStatement, Transaction, TransactionBuilder,
+};
+use std::task::Poll;
+use std::time::Duration;
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
-use tokio_postgres::types::{ToSql, Type};
-#[cfg(feature = "runtime")]
-use tokio_postgres::Socket;
-use tokio_postgres::{Error, Row, SimpleQueryMessage};
-
-#[cfg(feature = "runtime")]
-use crate::Config;
-use crate::{CopyOutReader, QueryIter, SimpleQueryIter, Statement, ToStatement, Transaction};
+use tokio_postgres::types::{BorrowToSql, ToSql, Type};
+use tokio_postgres::{Error, Row, SimpleQueryMessage, Socket};
 
 /// A synchronous PostgreSQL client.
-///
-/// This is a lightweight wrapper over the asynchronous tokio_postgres `Client`.
-pub struct Client(tokio_postgres::Client);
+pub struct Client {
+    connection: Connection,
+    client: tokio_postgres::Client,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = self.close_inner();
+    }
+}
 
 impl Client {
+    pub(crate) fn new(connection: Connection, client: tokio_postgres::Client) -> Client {
+        Client { connection, client }
+    }
+
     /// A convenience function which parses a configuration string into a `Config` and then connects to the database.
     ///
     /// See the documentation for [`Config`] for information about the connection syntax.
     ///
-    /// Requires the `runtime` Cargo feature (enabled by default).
-    ///
     /// [`Config`]: config/struct.Config.html
-    #[cfg(feature = "runtime")]
     pub fn connect<T>(params: &str, tls_mode: T) -> Result<Client, Error>
     where
         T: MakeTlsConnect<Socket> + 'static + Send,
@@ -36,9 +42,6 @@ impl Client {
     }
 
     /// Returns a new `Config` object which can be used to configure and connect to a database.
-    ///
-    /// Requires the `runtime` Cargo feature (enabled by default).
-    #[cfg(feature = "runtime")]
     pub fn configure() -> Config {
         Config::new()
     }
@@ -77,12 +80,11 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn execute<T>(&mut self, query: &T, params: &[&dyn ToSql]) -> Result<u64, Error>
+    pub fn execute<T>(&mut self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error>
     where
         T: ?Sized + ToStatement,
     {
-        let statement = query.__statement(self)?;
-        self.0.execute(&statement, params).wait()
+        self.connection.block_on(self.client.execute(query, params))
     }
 
     /// Executes a statement, returning the resulting rows.
@@ -93,8 +95,6 @@ impl Client {
     /// The `query` argument can either be a `Statement`, or a raw query string. If the same statement will be
     /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
     /// with the `prepare` method.
-    ///
-    /// The `query_iter` method can be used to avoid buffering all rows in memory at once.
     ///
     /// # Panics
     ///
@@ -116,15 +116,102 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn query<T>(&mut self, query: &T, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error>
+    pub fn query<T>(&mut self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error>
     where
         T: ?Sized + ToStatement,
     {
-        self.query_iter(query, params)?.collect()
+        self.connection.block_on(self.client.query(query, params))
     }
 
-    /// Like `query`, except that it returns a fallible iterator over the resulting rows rather than buffering the
-    /// response in memory.
+    /// Executes a statement which returns a single row, returning it.
+    ///
+    /// Returns an error if the query does not return exactly one row.
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    /// The `query` argument can either be a `Statement`, or a raw query string. If the same statement will be
+    /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
+    /// with the `prepare` method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use postgres::{Client, NoTls};
+    ///
+    /// # fn main() -> Result<(), postgres::Error> {
+    /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
+    ///
+    /// let baz = true;
+    /// let row = client.query_one("SELECT foo FROM bar WHERE baz = $1", &[&baz])?;
+    /// let foo: i32 = row.get("foo");
+    /// println!("foo: {}", foo);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn query_one<T>(&mut self, query: &T, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.connection
+            .block_on(self.client.query_one(query, params))
+    }
+
+    /// Executes a statement which returns zero or one rows, returning it.
+    ///
+    /// Returns an error if the query returns more than one row.
+    ///
+    /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
+    /// provided, 1-indexed.
+    ///
+    /// The `query` argument can either be a `Statement`, or a raw query string. If the same statement will be
+    /// repeatedly executed (perhaps with different query parameters), consider preparing the statement up front
+    /// with the `prepare` method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of parameters provided does not match the number expected.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use postgres::{Client, NoTls};
+    ///
+    /// # fn main() -> Result<(), postgres::Error> {
+    /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
+    ///
+    /// let baz = true;
+    /// let row = client.query_opt("SELECT foo FROM bar WHERE baz = $1", &[&baz])?;
+    /// match row {
+    ///     Some(row) => {
+    ///         let foo: i32 = row.get("foo");
+    ///         println!("foo: {}", foo);
+    ///     }
+    ///     None => println!("no matching foo"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn query_opt<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<Row>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.connection
+            .block_on(self.client.query_opt(query, params))
+    }
+
+    /// A maximally-flexible version of `query`.
+    ///
+    /// It takes an iterator of parameters rather than a slice, and returns an iterator of rows rather than collecting
+    /// them into an array.
     ///
     /// # Panics
     ///
@@ -135,12 +222,13 @@ impl Client {
     /// ```no_run
     /// use postgres::{Client, NoTls};
     /// use fallible_iterator::FallibleIterator;
+    /// use std::iter;
     ///
     /// # fn main() -> Result<(), postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let baz = true;
-    /// let mut it = client.query_iter("SELECT foo FROM bar WHERE baz = $1", &[&baz])?;
+    /// let mut it = client.query_raw("SELECT foo FROM bar WHERE baz = $1", iter::once(baz))?;
     ///
     /// while let Some(row) = it.next()? {
     ///     let foo: i32 = row.get("foo");
@@ -149,16 +237,44 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn query_iter<T>(
-        &mut self,
-        query: &T,
-        params: &[&dyn ToSql],
-    ) -> Result<QueryIter<'_>, Error>
+    ///
+    /// If you have a type like `Vec<T>` where `T: ToSql` Rust will not know how to use it as params. To get around
+    /// this the type must explicitly be converted to `&dyn ToSql`.
+    ///
+    /// ```no_run
+    /// # use postgres::{Client, NoTls};
+    /// use postgres::types::ToSql;
+    /// use fallible_iterator::FallibleIterator;
+    /// # fn main() -> Result<(), postgres::Error> {
+    /// # let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
+    ///
+    /// let params: Vec<String> = vec![
+    ///     "first param".into(),
+    ///     "second param".into(),
+    /// ];
+    /// let mut it = client.query_raw(
+    ///     "SELECT foo FROM bar WHERE biz = $1 AND baz = $2",
+    ///     params,
+    /// )?;
+    ///
+    /// while let Some(row) = it.next()? {
+    ///     let foo: i32 = row.get("foo");
+    ///     println!("foo: {}", foo);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn query_raw<T, P, I>(&mut self, query: &T, params: I) -> Result<RowIter<'_>, Error>
     where
         T: ?Sized + ToStatement,
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+        I::IntoIter: ExactSizeIterator,
     {
-        let statement = query.__statement(self)?;
-        Ok(QueryIter::new(self.0.query(&statement, params)))
+        let stream = self
+            .connection
+            .block_on(self.client.query_raw(query, params))?;
+        Ok(RowIter::new(self.connection.as_ref(), stream))
     }
 
     /// Creates a new prepared statement.
@@ -185,7 +301,7 @@ impl Client {
     /// # }
     /// ```
     pub fn prepare(&mut self, query: &str) -> Result<Statement, Error> {
-        self.0.prepare(query).wait()
+        self.connection.block_on(self.client.prepare(query))
     }
 
     /// Like `prepare`, but allows the types of query parameters to be explicitly specified.
@@ -216,45 +332,45 @@ impl Client {
     /// # }
     /// ```
     pub fn prepare_typed(&mut self, query: &str, types: &[Type]) -> Result<Statement, Error> {
-        self.0.prepare_typed(query, types).wait()
+        self.connection
+            .block_on(self.client.prepare_typed(query, types))
     }
 
     /// Executes a `COPY FROM STDIN` statement, returning the number of rows created.
     ///
     /// The `query` argument can either be a `Statement`, or a raw query string. The data in the provided reader is
     /// passed along to the server verbatim; it is the caller's responsibility to ensure it uses the proper format.
+    /// PostgreSQL does not support parameters in `COPY` statements, so this method does not take any.
+    ///
+    /// The copy *must* be explicitly completed via the `finish` method. If it is not, the copy will be aborted.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use postgres::{Client, NoTls};
+    /// use std::io::Write;
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
-    /// client.copy_in("COPY people FROM stdin", &[], &mut "1\tjohn\n2\tjane\n".as_bytes())?;
+    /// let mut writer = client.copy_in("COPY people FROM stdin")?;
+    /// writer.write_all(b"1\tjohn\n2\tjane\n")?;
+    /// writer.finish()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn copy_in<T, R>(
-        &mut self,
-        query: &T,
-        params: &[&dyn ToSql],
-        reader: R,
-    ) -> Result<u64, Error>
+    pub fn copy_in<T>(&mut self, query: &T) -> Result<CopyInWriter<'_>, Error>
     where
         T: ?Sized + ToStatement,
-        R: Read,
     {
-        let statement = query.__statement(self)?;
-        self.0
-            .copy_in(&statement, params, CopyInStream(reader))
-            .wait()
+        let sink = self.connection.block_on(self.client.copy_in(query))?;
+        Ok(CopyInWriter::new(self.connection.as_ref(), sink))
     }
 
     /// Executes a `COPY TO STDOUT` statement, returning a reader of the resulting data.
     ///
-    /// The `query` argument can either be a `Statement`, or a raw query string.
+    /// The `query` argument can either be a `Statement`, or a raw query string. PostgreSQL does not support parameters
+    /// in `COPY` statements, so this method does not take any.
     ///
     /// # Examples
     ///
@@ -262,26 +378,21 @@ impl Client {
     /// use postgres::{Client, NoTls};
     /// use std::io::Read;
     ///
-    /// # fn main() -> Result<(), Box<std::error::Error>> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
-    /// let mut reader = client.copy_out("COPY people TO stdout", &[])?;
+    /// let mut reader = client.copy_out("COPY people TO stdout")?;
     /// let mut buf = vec![];
     /// reader.read_to_end(&mut buf)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn copy_out<T>(
-        &mut self,
-        query: &T,
-        params: &[&dyn ToSql],
-    ) -> Result<CopyOutReader<'_>, Error>
+    pub fn copy_out<T>(&mut self, query: &T) -> Result<CopyOutReader<'_>, Error>
     where
         T: ?Sized + ToStatement,
     {
-        let statement = query.__statement(self)?;
-        let stream = self.0.copy_out(&statement, params);
-        CopyOutReader::new(stream)
+        let stream = self.connection.block_on(self.client.copy_out(query))?;
+        Ok(CopyOutReader::new(self.connection.as_ref(), stream))
     }
 
     /// Executes a sequence of SQL statements using the simple query protocol.
@@ -296,23 +407,39 @@ impl Client {
     ///
     /// # Warning
     ///
-    /// Prepared statements should be use for any query which contains user-specified data, as they provided the
-    /// functionality to safely imbed that data in the request. Do not form statements via string concatenation and pass
+    /// Prepared statements should be used for any query which contains user-specified data, as they provided the
+    /// functionality to safely embed that data in the request. Do not form statements via string concatenation and pass
     /// them to this method!
     pub fn simple_query(&mut self, query: &str) -> Result<Vec<SimpleQueryMessage>, Error> {
-        self.simple_query_iter(query)?.collect()
+        self.connection.block_on(self.client.simple_query(query))
     }
 
-    /// Like `simple_query`, except that it returns a fallible iterator over the resulting values rather than buffering
-    /// the response in memory.
+    /// Validates the connection by performing a simple no-op query.
+    ///
+    /// If the specified timeout is reached before the backend responds, an error will be returned.
+    pub fn is_valid(&mut self, timeout: Duration) -> Result<(), Error> {
+        let inner_client = &self.client;
+        self.connection.block_on(async {
+            let trivial_query = inner_client.simple_query("");
+            tokio::time::timeout(timeout, trivial_query)
+                .await
+                .map_err(|_| Error::__private_api_timeout())?
+                .map(|_| ())
+        })
+    }
+
+    /// Executes a sequence of SQL statements using the simple query protocol.
+    ///
+    /// Statements should be separated by semicolons. If an error occurs, execution of the sequence will stop at that
+    /// point. This is intended for use when, for example, initializing a database schema.
     ///
     /// # Warning
     ///
     /// Prepared statements should be use for any query which contains user-specified data, as they provided the
-    /// functionality to safely imbed that data in the request. Do not form statements via string concatenation and pass
+    /// functionality to safely embed that data in the request. Do not form statements via string concatenation and pass
     /// them to this method!
-    pub fn simple_query_iter(&mut self, query: &str) -> Result<SimpleQueryIter<'_>, Error> {
-        Ok(SimpleQueryIter::new(self.0.simple_query(query)))
+    pub fn batch_execute(&mut self, query: &str) -> Result<(), Error> {
+        self.connection.block_on(self.client.batch_execute(query))
     }
 
     /// Begins a new database transaction.
@@ -336,53 +463,117 @@ impl Client {
     /// # }
     /// ```
     pub fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        self.simple_query("BEGIN")?;
-        Ok(Transaction::new(self))
+        let transaction = self.connection.block_on(self.client.transaction())?;
+        Ok(Transaction::new(self.connection.as_ref(), transaction))
+    }
+
+    /// Returns a builder for a transaction with custom settings.
+    ///
+    /// Unlike the `transaction` method, the builder can be used to control the transaction's isolation level and other
+    /// attributes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use postgres::{Client, IsolationLevel, NoTls};
+    ///
+    /// # fn main() -> Result<(), postgres::Error> {
+    /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
+    ///
+    /// let mut transaction = client.build_transaction()
+    ///     .isolation_level(IsolationLevel::RepeatableRead)
+    ///     .start()?;
+    /// transaction.execute("UPDATE foo SET bar = 10", &[])?;
+    /// // ...
+    ///
+    /// transaction.commit()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn build_transaction(&mut self) -> TransactionBuilder<'_> {
+        TransactionBuilder::new(self.connection.as_ref(), self.client.build_transaction())
+    }
+
+    /// Returns a structure providing access to asynchronous notifications.
+    ///
+    /// Use the `LISTEN` command to register this connection for notifications.
+    pub fn notifications(&mut self) -> Notifications<'_> {
+        Notifications::new(self.connection.as_ref())
+    }
+
+    /// Constructs a cancellation token that can later be used to request cancellation of a query running on this
+    /// connection.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use postgres::{Client, NoTls};
+    /// use postgres::error::SqlState;
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
+    ///
+    /// let cancel_token = client.cancel_token();
+    ///
+    /// thread::spawn(move || {
+    ///     // Abort the query after 5s.
+    ///     thread::sleep(Duration::from_secs(5));
+    ///     let _ = cancel_token.cancel_query(NoTls);
+    /// });
+    ///
+    /// match client.simple_query("SELECT long_running_query()") {
+    ///     Err(e) if e.code() == Some(&SqlState::QUERY_CANCELED) => {
+    ///         // Handle canceled query.
+    ///     }
+    ///     Err(err) => return Err(err.into()),
+    ///     Ok(rows) => {
+    ///         // ...
+    ///     }
+    /// }
+    /// // ...
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn cancel_token(&self) -> CancelToken {
+        CancelToken::new(self.client.cancel_token())
+    }
+
+    /// Clears the client's type information cache.
+    ///
+    /// When user-defined types are used in a query, the client loads their definitions from the database and caches
+    /// them for the lifetime of the client. If those definitions are changed in the database, this method can be used
+    /// to flush the local cache and allow the new, updated definitions to be loaded.
+    pub fn clear_type_cache(&self) {
+        self.client.clear_type_cache();
     }
 
     /// Determines if the client's connection has already closed.
     ///
     /// If this returns `true`, the client is no longer usable.
     pub fn is_closed(&self) -> bool {
-        self.0.is_closed()
+        self.client.is_closed()
     }
 
-    /// Returns a shared reference to the inner nonblocking client.
-    pub fn get_ref(&self) -> &tokio_postgres::Client {
-        &self.0
+    /// Closes the client's connection to the server.
+    ///
+    /// This is equivalent to `Client`'s `Drop` implementation, except that it returns any error encountered to the
+    /// caller.
+    pub fn close(mut self) -> Result<(), Error> {
+        self.close_inner()
     }
 
-    /// Returns a mutable reference to the inner nonblocking client.
-    pub fn get_mut(&mut self) -> &mut tokio_postgres::Client {
-        &mut self.0
-    }
+    fn close_inner(&mut self) -> Result<(), Error> {
+        self.client.__private_api_close();
 
-    /// Consumes the client, returning the inner nonblocking client.
-    pub fn into_inner(self) -> tokio_postgres::Client {
-        self.0
-    }
-}
-
-impl From<tokio_postgres::Client> for Client {
-    fn from(c: tokio_postgres::Client) -> Client {
-        Client(c)
-    }
-}
-
-struct CopyInStream<R>(R);
-
-impl<R> Stream for CopyInStream<R>
-where
-    R: Read,
-{
-    type Item = Vec<u8>;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Option<Vec<u8>>, io::Error> {
-        let mut buf = vec![];
-        match self.0.by_ref().take(4096).read_to_end(&mut buf)? {
-            0 => Ok(Async::Ready(None)),
-            _ => Ok(Async::Ready(Some(buf))),
-        }
+        self.connection.poll_block_on(|_, _, done| {
+            if done {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
     }
 }

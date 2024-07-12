@@ -2,24 +2,20 @@
 //!
 //! Requires the `runtime` Cargo feature (enabled by default).
 
-use futures::future::Executor;
-use futures::sync::oneshot;
-use futures::Future;
-use log::error;
+use crate::connection::Connection;
+use crate::Client;
+use log::info;
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::runtime;
+#[doc(inline)]
+pub use tokio_postgres::config::{ChannelBinding, Host, SslMode, TargetSessionAttrs};
+use tokio_postgres::error::DbError;
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::{Error, Socket};
-
-#[doc(inline)]
-use tokio_postgres::config::{SslMode, TargetSessionAttrs};
-
-use crate::{Client, RUNTIME};
-
-type DynExecutor = dyn Executor<Box<dyn Future<Item = (), Error = ()> + Send>> + Sync + Send;
 
 /// Connection configuration.
 ///
@@ -52,6 +48,10 @@ type DynExecutor = dyn Executor<Box<dyn Future<Item = (), Error = ()> + Send>> +
 ///     This option is ignored when connecting with Unix sockets. Defaults to on.
 /// * `keepalives_idle` - The number of seconds of inactivity after which a keepalive message is sent to the server.
 ///     This option is ignored when connecting with Unix sockets. Defaults to 2 hours.
+/// * `keepalives_interval` - The time interval between TCP keepalive probes.
+///     This option is ignored when connecting with Unix sockets.
+/// * `keepalives_retries` - The maximum number of TCP keepalive probes that will be sent before dropping a connection.
+///     This option is ignored when connecting with Unix sockets.
 /// * `target_session_attrs` - Specifies requirements of the session. If set to `read-write`, the client will check that
 ///     the `transaction_read_write` session parameter is set to `on`. This can be used to connect to the primary server
 ///     in a database cluster as opposed to the secondary read-only mirrors. Defaults to `all`.
@@ -63,7 +63,7 @@ type DynExecutor = dyn Executor<Box<dyn Future<Item = (), Error = ()> + Send>> +
 /// ```
 ///
 /// ```not_rust
-/// host=/var/lib/postgresql,localhost port=1234 user=postgres password='password with spaces'
+/// host=/var/run/postgresql,localhost port=1234 user=postgres password='password with spaces'
 /// ```
 ///
 /// ```not_rust
@@ -84,7 +84,7 @@ type DynExecutor = dyn Executor<Box<dyn Future<Item = (), Error = ()> + Send>> +
 /// ```
 ///
 /// ```not_rust
-/// postgresql://user:password@%2Fvar%2Flib%2Fpostgresql/mydb?connect_timeout=10
+/// postgresql://user:password@%2Fvar%2Frun%2Fpostgresql/mydb?connect_timeout=10
 /// ```
 ///
 /// ```not_rust
@@ -92,13 +92,12 @@ type DynExecutor = dyn Executor<Box<dyn Future<Item = (), Error = ()> + Send>> +
 /// ```
 ///
 /// ```not_rust
-/// postgresql:///mydb?user=user&host=/var/lib/postgresql
+/// postgresql:///mydb?user=user&host=/var/run/postgresql
 /// ```
 #[derive(Clone)]
 pub struct Config {
     config: tokio_postgres::Config,
-    // this is an option since we don't want to boot up our default runtime unless we're actually going to use it.
-    executor: Option<Arc<DynExecutor>>,
+    notice_callback: Arc<dyn Fn(DbError) + Send + Sync>,
 }
 
 impl fmt::Debug for Config {
@@ -118,10 +117,7 @@ impl Default for Config {
 impl Config {
     /// Creates a new configuration.
     pub fn new() -> Config {
-        Config {
-            config: tokio_postgres::Config::new(),
-            executor: None,
-        }
+        tokio_postgres::Config::new().into()
     }
 
     /// Sets the user to authenticate with.
@@ -130,6 +126,12 @@ impl Config {
     pub fn user(&mut self, user: &str) -> &mut Config {
         self.config.user(user);
         self
+    }
+
+    /// Gets the user to authenticate with, if one has been configured with
+    /// the `user` method.
+    pub fn get_user(&self) -> Option<&str> {
+        self.config.get_user()
     }
 
     /// Sets the password to authenticate with.
@@ -141,6 +143,12 @@ impl Config {
         self
     }
 
+    /// Gets the password to authenticate with, if one has been configured with
+    /// the `password` method.
+    pub fn get_password(&self) -> Option<&[u8]> {
+        self.config.get_password()
+    }
+
     /// Sets the name of the database to connect to.
     ///
     /// Defaults to the user.
@@ -149,16 +157,34 @@ impl Config {
         self
     }
 
+    /// Gets the name of the database to connect to, if one has been configured
+    /// with the `dbname` method.
+    pub fn get_dbname(&self) -> Option<&str> {
+        self.config.get_dbname()
+    }
+
     /// Sets command line options used to configure the server.
     pub fn options(&mut self, options: &str) -> &mut Config {
         self.config.options(options);
         self
     }
 
+    /// Gets the command line options used to configure the server, if the
+    /// options have been set with the `options` method.
+    pub fn get_options(&self) -> Option<&str> {
+        self.config.get_options()
+    }
+
     /// Sets the value of the `application_name` runtime parameter.
     pub fn application_name(&mut self, application_name: &str) -> &mut Config {
         self.config.application_name(application_name);
         self
+    }
+
+    /// Gets the value of the `application_name` runtime parameter, if it has
+    /// been set with the `application_name` method.
+    pub fn get_application_name(&self) -> Option<&str> {
+        self.config.get_application_name()
     }
 
     /// Sets the SSL configuration.
@@ -169,6 +195,11 @@ impl Config {
         self
     }
 
+    /// Gets the SSL configuration.
+    pub fn get_ssl_mode(&self) -> SslMode {
+        self.config.get_ssl_mode()
+    }
+
     /// Adds a host to the configuration.
     ///
     /// Multiple hosts can be specified by calling this method multiple times, and each will be tried in order. On Unix
@@ -176,6 +207,11 @@ impl Config {
     pub fn host(&mut self, host: &str) -> &mut Config {
         self.config.host(host);
         self
+    }
+
+    /// Gets the hosts that have been added to the configuration with `host`.
+    pub fn get_hosts(&self) -> &[Host] {
+        self.config.get_hosts()
     }
 
     /// Adds a Unix socket host to the configuration.
@@ -200,6 +236,11 @@ impl Config {
         self
     }
 
+    /// Gets the ports that have been added to the configuration with `port`.
+    pub fn get_ports(&self) -> &[u16] {
+        self.config.get_ports()
+    }
+
     /// Sets the timeout applied to socket-level connection attempts.
     ///
     /// Note that hostnames can resolve to multiple IP addresses, and this timeout will apply to each address of each
@@ -207,6 +248,12 @@ impl Config {
     pub fn connect_timeout(&mut self, connect_timeout: Duration) -> &mut Config {
         self.config.connect_timeout(connect_timeout);
         self
+    }
+
+    /// Gets the connection timeout, if one has been set with the
+    /// `connect_timeout` method.
+    pub fn get_connect_timeout(&self) -> Option<&Duration> {
+        self.config.get_connect_timeout()
     }
 
     /// Controls the use of TCP keepalive.
@@ -217,12 +264,50 @@ impl Config {
         self
     }
 
+    /// Reports whether TCP keepalives will be used.
+    pub fn get_keepalives(&self) -> bool {
+        self.config.get_keepalives()
+    }
+
     /// Sets the amount of idle time before a keepalive packet is sent on the connection.
     ///
     /// This is ignored for Unix domain sockets, or if the `keepalives` option is disabled. Defaults to 2 hours.
     pub fn keepalives_idle(&mut self, keepalives_idle: Duration) -> &mut Config {
         self.config.keepalives_idle(keepalives_idle);
         self
+    }
+
+    /// Gets the configured amount of idle time before a keepalive packet will
+    /// be sent on the connection.
+    pub fn get_keepalives_idle(&self) -> Duration {
+        self.config.get_keepalives_idle()
+    }
+
+    /// Sets the time interval between TCP keepalive probes.
+    /// On Windows, this sets the value of the tcp_keepalive struct’s keepaliveinterval field.
+    ///
+    /// This is ignored for Unix domain sockets, or if the `keepalives` option is disabled.
+    pub fn keepalives_interval(&mut self, keepalives_interval: Duration) -> &mut Config {
+        self.config.keepalives_interval(keepalives_interval);
+        self
+    }
+
+    /// Gets the time interval between TCP keepalive probes.
+    pub fn get_keepalives_interval(&self) -> Option<Duration> {
+        self.config.get_keepalives_interval()
+    }
+
+    /// Sets the maximum number of TCP keepalive probes that will be sent before dropping a connection.
+    ///
+    /// This is ignored for Unix domain sockets, or if the `keepalives` option is disabled.
+    pub fn keepalives_retries(&mut self, keepalives_retries: u32) -> &mut Config {
+        self.config.keepalives_retries(keepalives_retries);
+        self
+    }
+
+    /// Gets the maximum number of TCP keepalive probes that will be sent before dropping a connection.
+    pub fn get_keepalives_retries(&self) -> Option<u32> {
+        self.config.get_keepalives_retries()
     }
 
     /// Sets the requirements of the session.
@@ -237,49 +322,60 @@ impl Config {
         self
     }
 
-    /// Sets the executor used to run the connection futures.
+    /// Gets the requirements of the session.
+    pub fn get_target_session_attrs(&self) -> TargetSessionAttrs {
+        self.config.get_target_session_attrs()
+    }
+
+    /// Sets the channel binding behavior.
     ///
-    /// Defaults to a postgres-specific tokio `Runtime`.
-    pub fn executor<E>(&mut self, executor: E) -> &mut Config
+    /// Defaults to `prefer`.
+    pub fn channel_binding(&mut self, channel_binding: ChannelBinding) -> &mut Config {
+        self.config.channel_binding(channel_binding);
+        self
+    }
+
+    /// Gets the channel binding behavior.
+    pub fn get_channel_binding(&self) -> ChannelBinding {
+        self.config.get_channel_binding()
+    }
+
+    /// Sets the notice callback.
+    ///
+    /// This callback will be invoked with the contents of every
+    /// [`AsyncMessage::Notice`] that is received by the connection. Notices use
+    /// the same structure as errors, but they are not "errors" per-se.
+    ///
+    /// Notices are distinct from notifications, which are instead accessible
+    /// via the [`Notifications`] API.
+    ///
+    /// [`AsyncMessage::Notice`]: tokio_postgres::AsyncMessage::Notice
+    /// [`Notifications`]: crate::Notifications
+    pub fn notice_callback<F>(&mut self, f: F) -> &mut Config
     where
-        E: Executor<Box<dyn Future<Item = (), Error = ()> + Send>> + 'static + Sync + Send,
+        F: Fn(DbError) + Send + Sync + 'static,
     {
-        self.executor = Some(Arc::new(executor));
+        self.notice_callback = Arc::new(f);
         self
     }
 
     /// Opens a connection to a PostgreSQL database.
-    pub fn connect<T>(&self, tls_mode: T) -> Result<Client, Error>
+    pub fn connect<T>(&self, tls: T) -> Result<Client, Error>
     where
         T: MakeTlsConnect<Socket> + 'static + Send,
         T::TlsConnect: Send,
         T::Stream: Send,
         <T::TlsConnect as TlsConnect<Socket>>::Future: Send,
     {
-        let (tx, rx) = oneshot::channel();
-        let connect = self
-            .config
-            .connect(tls_mode)
-            .then(|r| tx.send(r).map_err(|_| ()));
-        self.with_executor(|e| e.execute(Box::new(connect)))
-            .unwrap();
-        let (client, connection) = rx.wait().unwrap()?;
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap(); // FIXME don't unwrap
 
-        let connection = connection.map_err(|e| error!("postgres connection error: {}", e));
-        self.with_executor(|e| e.execute(Box::new(connection)))
-            .unwrap();
+        let (client, connection) = runtime.block_on(self.config.connect(tls))?;
 
-        Ok(Client::from(client))
-    }
-
-    fn with_executor<F, T>(&self, f: F) -> T
-    where
-        F: FnOnce(&dyn Executor<Box<dyn Future<Item = (), Error = ()> + Send>>) -> T,
-    {
-        match &self.executor {
-            Some(e) => f(&**e),
-            None => f(&RUNTIME.executor()),
-        }
+        let connection = Connection::new(runtime, connection, self.notice_callback.clone());
+        Ok(Client::new(connection, client))
     }
 }
 
@@ -295,7 +391,9 @@ impl From<tokio_postgres::Config> for Config {
     fn from(config: tokio_postgres::Config) -> Config {
         Config {
             config,
-            executor: None,
+            notice_callback: Arc::new(|notice| {
+                info!("{}: {}", notice.severity(), notice.message())
+            }),
         }
     }
 }

@@ -53,7 +53,7 @@ impl Header {
         if len < 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid message length",
+                "invalid message length: header length < 4",
             ));
         }
 
@@ -72,6 +72,7 @@ impl Header {
 }
 
 /// An enum representing Postgres backend messages.
+#[non_exhaustive]
 pub enum Message {
     AuthenticationCleartextPassword,
     AuthenticationGss,
@@ -104,8 +105,6 @@ pub enum Message {
     PortalSuspended,
     ReadyForQuery(ReadyForQueryBody),
     RowDescription(RowDescriptionBody),
-    #[doc(hidden)]
-    __ForExtensibility,
 }
 
 impl Message {
@@ -123,7 +122,7 @@ impl Message {
         if len < 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid message length",
+                "invalid message length: parsing u32",
             ));
         }
 
@@ -271,7 +270,7 @@ impl Message {
         if !buf.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid message length",
+                "invalid message length: expected buffer to be empty",
             ));
         }
 
@@ -285,20 +284,23 @@ struct Buffer {
 }
 
 impl Buffer {
+    #[inline]
     fn slice(&self) -> &[u8] {
         &self.bytes[self.idx..]
     }
 
+    #[inline]
     fn is_empty(&self) -> bool {
         self.slice().is_empty()
     }
 
+    #[inline]
     fn read_cstr(&mut self) -> io::Result<Bytes> {
         match memchr(0, self.slice()) {
             Some(pos) => {
                 let start = self.idx;
                 let end = start + pos;
-                let cstr = self.bytes.slice(start, end);
+                let cstr = self.bytes.slice(start..end);
                 self.idx = end + 1;
                 Ok(cstr)
             }
@@ -309,14 +311,16 @@ impl Buffer {
         }
     }
 
+    #[inline]
     fn read_all(&mut self) -> Bytes {
-        let buf = self.bytes.slice_from(self.idx);
+        let buf = self.bytes.slice(self.idx..);
         self.idx = self.bytes.len();
         buf
     }
 }
 
 impl Read for Buffer {
+    #[inline]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = {
             let slice = self.slice();
@@ -371,7 +375,7 @@ impl<'a> FallibleIterator for SaslMechanisms<'a> {
             if self.0.len() != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "invalid message length",
+                    "invalid message length: expected to be at end of iterator for sasl",
                 ));
             }
             Ok(None)
@@ -446,9 +450,9 @@ impl CopyDataBody {
 }
 
 pub struct CopyInResponseBody {
-    storage: Bytes,
-    len: u16,
     format: u8,
+    len: u16,
+    storage: Bytes,
 }
 
 impl CopyInResponseBody {
@@ -483,7 +487,7 @@ impl<'a> FallibleIterator for ColumnFormats<'a> {
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "invalid message length",
+                    "invalid message length: wrong column formats",
                 ));
             }
         }
@@ -500,9 +504,9 @@ impl<'a> FallibleIterator for ColumnFormats<'a> {
 }
 
 pub struct CopyOutResponseBody {
-    storage: Bytes,
-    len: u16,
     format: u8,
+    len: u16,
+    storage: Bytes,
 }
 
 impl CopyOutResponseBody {
@@ -520,6 +524,7 @@ impl CopyOutResponseBody {
     }
 }
 
+#[derive(Debug)]
 pub struct DataRowBody {
     storage: Bytes,
     len: u16,
@@ -559,7 +564,7 @@ impl<'a> FallibleIterator for DataRowRanges<'a> {
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "invalid message length",
+                    "invalid message length: datarowrange is not empty",
                 ));
             }
         }
@@ -577,7 +582,7 @@ impl<'a> FallibleIterator for DataRowRanges<'a> {
                 ));
             }
             let base = self.len - self.buf.len();
-            self.buf = &self.buf[len as usize..];
+            self.buf = &self.buf[len..];
             Ok(Some(Some(base..base + len)))
         }
     }
@@ -617,7 +622,7 @@ impl<'a> FallibleIterator for ErrorFields<'a> {
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "invalid message length",
+                    "invalid message length: error fields is not drained",
                 ));
             }
         }
@@ -713,7 +718,7 @@ impl<'a> FallibleIterator for Parameters<'a> {
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "invalid message length",
+                    "invalid message length: parameters is not drained",
                 ));
             }
         }
@@ -789,7 +794,7 @@ impl<'a> FallibleIterator for Fields<'a> {
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "invalid message length",
+                    "invalid message length: field is not drained",
                 ));
             }
         }

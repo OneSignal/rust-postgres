@@ -1,5 +1,144 @@
 # Change Log
 
+## v0.19.4 - 2022-08-21
+
+## Added
+
+* Added `ToSql` and `FromSql` implementations for `[u8; N]` via the `array-impls` feature.
+* Added support for `smol_str` 0.1 via the `with-smol_str-01` feature.
+* Added `ToSql::encode_format` to support text encodings of parameters.
+
+## v0.19.3 - 2022-04-30
+
+### Added
+
+* Added support for `uuid` 1.0 via the `with-uuid-1` feature.
+
+## v0.19.2 - 2021-09-29
+
+### Added
+
+* Added `SimpleQueryRow::columns`.
+* Added support for `eui48` 1.0 via the `with-eui48-1` feature.
+* Added `FromSql` and `ToSql` implementations for arrays via the `array-impls` feature.
+* Added support for `time` 0.3 via the `with-time-0_3` feature.
+
+## v0.19.1 - 2021-04-03
+
+### Added
+
+* Added support for `geo-types` 0.7 via `with-geo-types-0_7` feature.
+* Added `Client::clear_type_cache`.
+
+## v0.19.0 - 2020-12-25
+
+### Changed
+
+* Upgraded to `tokio-postgres` 0.7.
+* Methods taking iterators of `ToSql` values can now take both `&dyn ToSql` and `T: ToSql` values.
+
+### Added
+
+* Added `Client::is_valid` which can be used to check that the connection is still alive with a
+    timeout.
+
+## v0.18.1 - 2020-10-19
+
+### Fixed
+
+* Restored the `Send` implementation for `Client`.
+
+## v0.18.0 - 2020-10-17
+
+### Changed
+
+* Upgraded to `tokio-postgres` 0.6.
+
+### Added
+
+* Added `Config::notice_callback`, which can be used to provide a custom callback for notices.
+
+### Fixed
+
+* Fixed client shutdown to explicitly terminate the database session.
+
+## v0.17.5 - 2020-07-19
+
+### Fixed
+
+* Fixed transactions to roll back immediately on drop.
+
+## v0.17.4 - 2020-07-03
+
+### Added
+
+* Added support for `geo-types` 0.6.
+
+## v0.17.3 - 2020-05-01
+
+### Fixed
+
+* Errors sent by the server will now be returned from `Client` methods rather than just being logged.
+
+### Added
+
+* Added `Transaction::savepoint`, which can be used to create a savepoint with a custom name.
+* Added `Client::notifications`, which returns an interface to the notifications sent by the server.
+
+## v0.17.2 - 2020-03-05
+
+### Added
+
+* Added `Debug` implementations for `Client`, `Row`, and `Column`.
+* Added `time` 0.2 support.
+
+## v0.17.1 - 2020-01-31
+
+### Added
+
+* Added `Client::build_transaction` to allow configuration of various transaction options.
+* Added `Client::cancel_token`, which returns a separate owned object that can be used to cancel queries.
+* Added accessors for `Config` fields.
+* Added a `GenericClient` trait implemented for `Client` and `Transaction` and covering shared functionality.
+
+## v0.17.0 - 2019-12-23
+
+### Changed
+
+* Each `Client` now has its own non-threaded tokio `Runtime` rather than sharing a global threaded `Runtime`. This
+    significantly improves performance by minimizing context switches and cross-thread synchronization.
+* `Client::copy_in` now returns a writer rather than taking in a reader.
+* `Client::query_raw` now returns a named type.
+* `Client::copy_in` and `Client::copy_out` no longer take query parameters as PostgreSQL doesn't support them in COPY
+    queries.
+
+### Removed
+
+* Removed support for `uuid` 0.7.
+
+### Added
+
+* Added `Client::query_opt` for queries that are expected to return zero or one rows.
+* Added binary copy support in the `binary_copy` module.
+* The `fallible-iterator` crate is now publicly reexported.
+
+## v0.17.0-alpha.2 - 2019-11-27
+
+### Changed
+
+* Changed `Config::executor` to `Config::spawner`.
+
+### Added
+
+* Added support for `uuid` 0.8.
+* Added `Transaction::query_one`.
+
+## v0.17.0-alpha.1 - 2019-10-14
+
+### Changed
+
+* Updated `tokio-postgres` to 0.5.0-alpha.1.
+
 ## v0.16.0-rc.2 - 2019-06-29
 
 ### Fixed
